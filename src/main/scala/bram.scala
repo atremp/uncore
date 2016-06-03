@@ -65,6 +65,75 @@ class BRAMSlave(depth: Int)(implicit val p: Parameters) extends Module
   io.acquire.ready := !stall
 }
 
+class NastiRAM(depth: Int)(implicit p: Parameters) extends NastiModule()(p) {
+  val io = (new NastiIO).flip
+
+  val nastiDataBytes = nastiXDataBits / 8
+
+  val ram = Mem(depth, Vec(nastiDataBytes, Bits(width = 8)))
+
+  val max_size = log2Ceil(nastiDataBytes)
+  val wmask_lut = Vec.tabulate(max_size + 1) { sz => UInt((1 << (1 << sz)) - 1) }
+  val addr = Reg(UInt(width = nastiXAddrBits))
+  val size = Reg(UInt(width = nastiXSizeBits))
+  val len = Reg(UInt(width = nastiXLenBits))
+  val wmask = (wmask_lut(size) << addr(max_size - 1, 0)) & io.w.bits.strb
+
+  val wdata = Vec.tabulate(nastiDataBytes)(i => io.w.bits.data(8*(i+1)-1,8*i))
+  val rdata = ram(addr >> UInt(max_size)).toBits
+
+  val id = Reg(UInt(width = nastiXIdBits))
+
+  val (s_idle :: s_read :: s_write_data :: s_write_resp :: Nil) =
+    Enum(Bits(), 4)
+  val state = Reg(init = s_idle)
+
+  io.aw.ready := (state === s_idle)
+  io.ar.ready := (state === s_idle) && !io.aw.valid
+  io.w.ready := (state === s_write_data)
+
+  io.b.valid := (state === s_write_resp)
+  io.b.bits := NastiWriteResponseChannel(id = id)
+
+  io.r.valid := (state === s_read)
+  io.r.bits := NastiReadDataChannel(
+    id = id,
+    data = rdata,
+    last = (len === UInt(0)))
+
+  when (io.aw.fire()) {
+    addr := io.aw.bits.addr
+    size := io.aw.bits.size
+    len := io.aw.bits.len
+    id := io.aw.bits.id
+    state := s_write_data
+  }
+
+  when (io.w.fire()) {
+    val real_wmask = Vec(wmask.toBools.slice(0, nastiDataBytes))
+    ram.write(addr >> UInt(max_size), wdata, real_wmask)
+    addr := addr + (UInt(1) << size)
+    len := len - UInt(1)
+    when (len === UInt(0)) { state := s_write_resp }
+  }
+
+  when (io.b.fire()) { state := s_idle }
+
+  when (io.ar.fire()) {
+    addr := io.ar.bits.addr
+    size := io.ar.bits.size
+    len := io.ar.bits.len
+    id := io.ar.bits.id
+    state := s_read
+  }
+
+  when (io.r.fire()) {
+    addr := addr + (UInt(1) << size)
+    len := len - UInt(1)
+    when (len === UInt(0)) { state := s_idle }
+  }
+}
+
 class HastiRAM(depth: Int)(implicit p: Parameters) extends HastiModule()(p) {
   val io = new HastiSlaveIO
 
