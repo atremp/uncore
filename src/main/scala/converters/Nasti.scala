@@ -260,6 +260,13 @@ class TileLinkIONastiIOConverter(implicit p: Parameters) extends TLModule()(p)
 
   private val blockOffset = tlByteAddrBits + tlBeatAddrBits
 
+  val tlMaxXacts = 1 // tlMaxClientXacts * tlMaxClientsPerPort
+  val idMapVal  = Reg(Vec(tlMaxXacts, UInt(width = nastiXIdBits)))
+  val idMapFree = RegInit(Vec.fill(tlMaxXacts){Bool(true)})
+  
+  val freeId = PriorityEncoder(idMapFree)
+  val free = idMapFree.reduce (_ || _)
+
   val aw_req = Reg(new NastiWriteAddressChannel)
 
   def is_singlebeat(chan: NastiAddressChannel): Bool =
@@ -312,6 +319,17 @@ class TileLinkIONastiIOConverter(implicit p: Parameters) extends TLModule()(p)
   when (io.nasti.aw.fire()) {
     aw_req := io.nasti.aw.bits
     state := s_put
+    idMapFree(freeId) := Bool(false)
+    idMapVal(freeId) := io.nasti.aw.bits.id;
+  }
+  
+  when (io.nasti.ar.fire()) {
+    idMapFree(freeId) := Bool(false)
+    idMapVal(freeId) := io.nasti.ar.bits.id;
+  }
+
+  when (io.tl.grant.fire()) {
+    idMapFree(io.tl.grant.bits.client_xact_id) := Bool(true)
   }
 
   when (io.nasti.w.fire()) {
@@ -321,13 +339,13 @@ class TileLinkIONastiIOConverter(implicit p: Parameters) extends TLModule()(p)
       state := s_idle
     }
   }
-
+  
   val get_acquire = Mux(is_multibeat(io.nasti.ar.bits),
     GetBlock(
-      client_xact_id = io.nasti.ar.bits.id,
+      client_xact_id = freeId,
       addr_block = nasti_addr_block(io.nasti.ar.bits)),
     Get(
-      client_xact_id = io.nasti.ar.bits.id,
+      client_xact_id = freeId,
       addr_block = nasti_addr_block(io.nasti.ar.bits),
       addr_beat = nasti_addr_beat(io.nasti.ar.bits),
       addr_byte = nasti_addr_byte(io.nasti.ar.bits),
@@ -336,39 +354,37 @@ class TileLinkIONastiIOConverter(implicit p: Parameters) extends TLModule()(p)
 
   val put_acquire = Mux(is_multibeat(aw_req),
     PutBlock(
-      client_xact_id = aw_req.id,
+      client_xact_id = freeId,
       addr_block = nasti_addr_block(aw_req),
       addr_beat = put_count,
       data = io.nasti.w.bits.data,
       wmask = Some(io.nasti.w.bits.strb)),
     Put(
-      client_xact_id = aw_req.id,
+      client_xact_id = freeId,
       addr_block = nasti_addr_block(aw_req),
       addr_beat = nasti_addr_beat(aw_req),
       data = io.nasti.w.bits.data,
       wmask = Some(nasti_wmask(aw_req, io.nasti.w.bits))))
 
   io.tl.acquire.bits := Mux(state === s_put, put_acquire, get_acquire)
-  io.tl.acquire.valid := (state === s_idle && io.nasti.ar.valid) ||
-                         (state === s_put && io.nasti.w.valid)
-  io.nasti.ar.ready := (state === s_idle && io.tl.acquire.ready)
-  io.nasti.aw.ready := (state === s_idle && !io.nasti.ar.valid)
+  io.tl.acquire.valid := ((state === s_idle && io.nasti.ar.valid && free) ||
+                          (state === s_put && io.nasti.w.valid))
+  io.nasti.ar.ready := free && (state === s_idle && io.tl.acquire.ready)
+  io.nasti.aw.ready := free && (state === s_idle && !io.nasti.ar.valid)
   io.nasti.w.ready  := (state === s_put && io.tl.acquire.ready)
 
   val nXacts = tlMaxClientXacts * tlMaxClientsPerPort
 
   io.nasti.b.valid := io.tl.grant.valid && tl_b_grant(io.tl.grant.bits)
   io.nasti.b.bits := NastiWriteResponseChannel(
-    id = io.tl.grant.bits.client_xact_id)
+    id = idMapVal(io.tl.grant.bits.client_xact_id))
 
   io.nasti.r.valid := io.tl.grant.valid && !tl_b_grant(io.tl.grant.bits)
   io.nasti.r.bits := NastiReadDataChannel(
-    id = io.tl.grant.bits.client_xact_id,
+    id = idMapVal(io.tl.grant.bits.client_xact_id),
     data = io.tl.grant.bits.data,
     last = tl_last(io.tl.grant.bits))
 
   io.tl.grant.ready := Mux(tl_b_grant(io.tl.grant.bits),
     io.nasti.b.ready, io.nasti.r.ready)
 }
-
-
